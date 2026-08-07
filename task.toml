@@ -1,4 +1,15 @@
 name = "weld-defects"
+
+# The verifier reads only these paths from the agent's final environment. Must stay
+# top-level: nested under [verifier] the value is silently dropped.
+artifacts = [
+    "/app/predictor/src/",
+    "/app/predictor/Cargo.toml",
+    "/app/predictor/Cargo.lock",
+    "/app/data/",
+]
+
+[metadata]
 category = "ML"
 subcategory = "Training"
 tags = ["rust", "smartcore", "cargo", "classification", "imbalanced-data"]
@@ -63,15 +74,8 @@ weighted fit from a well-tuned but misdirected one. Implementing it in smartcore
 no sample_weight argument, meant doing the rebalancing by explicit resampling.
 """
 
-artifacts = [
-    "/app/predictor/src/",
-    "/app/predictor/Cargo.toml",
-    "/app/predictor/Cargo.lock",
-    "/app/data/",
-]
-
 [verifier]
-timeout_sec = 600
+timeout_sec = 1800
 environment_mode = "separate"
 
 [agent]
