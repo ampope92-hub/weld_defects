@@ -71,11 +71,13 @@ def _macro_recall(called, truth):
 
 
 def test_shipped_data_unmodified():
+    """The shipped train.csv and test_features.csv are byte-for-byte as issued."""
     assert _sha(TEST_FEATURES) == TEST_FEATURES_SHA, "test_features.csv was altered"
     assert _sha(pathlib.Path("/app/data/train.csv")) == TRAIN_SHA, "train.csv was altered"
 
 
 def test_schema(preds):
+    """predictions.csv carries exactly the two columns weld_id and defect."""
     header, _ = preds
     assert header == ["weld_id", "defect"], (
         f"predictions.csv must have exactly columns weld_id,defect, got {header}"
@@ -83,6 +85,7 @@ def test_schema(preds):
 
 
 def test_covers_every_weld_exactly_once(preds, labels):
+    """Every held-back weld has exactly one row — no duplicates, omissions or unknown ids."""
     _, rows = preds
     ids = [row[0] for row in rows]
     assert len(ids) == len(set(ids)), "duplicate weld_id entries"
@@ -93,6 +96,7 @@ def test_covers_every_weld_exactly_once(preds, labels):
 
 
 def test_calls_are_known_findings(preds):
+    """Every call is one of the five findings the inspection log records."""
     _, rows = preds
     bad = sorted({row[1] for row in rows} - FINDINGS)
     assert not bad, (
@@ -101,6 +105,7 @@ def test_calls_are_known_findings(preds):
 
 
 def test_calls_not_single_class(preds):
+    """The classifier calls at least three distinct findings rather than collapsing."""
     _, rows = preds
     distinct = {row[1] for row in rows}
     assert len(distinct) >= 3, (
@@ -109,6 +114,7 @@ def test_calls_not_single_class(preds):
 
 
 def test_macro_recall_bar(preds, labels):
+    """Mean per-defect catch rate against the withheld findings reaches the required 0.47."""
     _, rows = preds
     called = [row[1] for row in rows]
     truth = [labels[row[0]] for row in rows]
