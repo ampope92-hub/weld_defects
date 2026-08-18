@@ -26,19 +26,46 @@ COPY --from=rust /usr/local/rustup /usr/local/rustup
 # Verifier tooling, pinned. Nothing is installed at trial time.
 RUN pip install --no-cache-dir pytest==8.4.1 pytest-json-ctrf==0.3.5
 
+# test.sh rebuilds and runs the agent's crate, so agent-authored code executes in this
+# image — and this image holds the answer key. That code runs as `runner`, never root:
+# runner owns the crate and the cargo cache and nothing else.
+RUN useradd --create-home --uid 10001 --shell /bin/bash runner
+
 # The crate skeleton mirrors environment/predictor's manifest so the dependency tree can
 # be fetched and compiled now, while the build still has a network. The agent's own
 # src/, Cargo.toml and Cargo.lock arrive later as artifacts and overwrite these, leaving
 # only the crate's own sources to recompile. Keep this in sync with
 # environment/predictor/Cargo.{toml,lock}.
 COPY skeleton /app/predictor
+# The prebuilt skeleton binary must NOT survive into the image. `rm -rf src` alone leaves
+# target/release/{pkg} and its fingerprint behind, and cargo decides freshness by mtime:
+# when Harbor uploads the agent's sources with an mtime older than this layer, cargo skips
+# the rebuild ("Finished" with no "Compiling"), runs the stale `fn main() {}` binary, and
+# nothing is written — the graded output stops coming from the agent's code at all. That is
+# a silent failure: it looks like the agent produced nothing. `cargo clean -p` drops just
+# this crate's artifacts and keeps the compiled dependency tree, which is the whole point
+# of the skeleton.
 RUN cd /app/predictor \
     && CARGO_NET_OFFLINE=false cargo fetch --locked \
     && cargo build --release --offline \
+    && cargo clean --release -p weld_predictor \
     && rm -rf /app/predictor/src
 
 # Artifact landing directories must exist before Harbor uploads the declared artifacts.
 RUN mkdir -p /app/predictor/src /app/data
+
+# Building as `runner` means cargo writes target/ and the CARGO_HOME package-cache lock;
+# neither holds anything secret. /app is runner-owned so the crate can create
+# /app/predictions.csv, but sticky so runner cannot rename or delete the root-owned
+# export it sits beside.
+RUN chown -R runner:runner /app /usr/local/cargo \
+    && chmod 1755 /app
+
+# The graded answer key, at a path Harbor does not reserve, readable only by root. /tests is
+# a runtime mount — permissions set on it here are both ineffective and a documented cause of
+# verifier failure — so the labels cannot be protected there. test_outputs.py reads this copy.
+COPY golden /opt/golden
+RUN chmod 700 /opt/golden && chmod 600 /opt/golden/*
 
 COPY . /tests/
 

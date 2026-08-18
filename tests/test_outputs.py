@@ -5,7 +5,7 @@ Cargo project at /app/predictor, so the file graded here is always the output of
 clean release build. We check that the file exists, its schema, that it covers every
 held-back weld exactly once, that every call is one of the five recorded findings, that
 the calls are not all one class, that the shipped export was not edited, and that the
-mean per-defect-type catch rate against /tests/golden/test_labels.csv (never present in
+mean per-defect-type catch rate against /opt/golden/test_labels.csv (never present in
 the agent environment) reaches the 0.47 stated in the task.
 
 The score is macro-averaged recall: for each of the five findings, the share of welds
@@ -21,7 +21,9 @@ import pathlib
 import pytest
 
 PRED_PATH = pathlib.Path("/app/predictions.csv")
-LABELS_PATH = pathlib.Path("/tests/golden/test_labels.csv")
+# Read from the root-only copy baked into the verifier image, not the /tests mount: the
+# agent's crate is rebuilt and run in this container, and only this path is closed to it.
+LABELS_PATH = pathlib.Path("/opt/golden/test_labels.csv")
 TEST_FEATURES = pathlib.Path("/app/data/test_features.csv")
 MACRO_RECALL_BAR = 0.47
 FINDINGS = {"none", "porosity", "undercut", "lack_of_fusion", "crack"}
