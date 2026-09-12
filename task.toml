@@ -20,83 +20,65 @@ author_name = "anonymous"
 author_email = "anonymous"
 
 difficulty_explanation = """
-The inspection findings are steeply imbalanced — 70% of welds are clean and cracks are 2% —
-and the grade is the mean per-defect-type catch rate, with a crack counting exactly as much
-as a clean weld. Every classifier fits for overall accuracy unless told otherwise, and on
-this data that means calling almost everything clean or porosity: it reaches about 78%
-accuracy and 0.41 on the graded metric, against a 0.47 bar. The trap is that the usual
-escape routes do nothing. More capacity does not help — tuned boosting and random forests
-land in the same place as plain logistic regression, because the fitting objective rather
-than the model is what is wrong. The rare classes are genuinely separable, so this is not a
-hopeless-minority problem; it is a weighting problem. On top of that, smartcore has no
-sample_weight argument on its classifiers, so the familiar one-line fix is unavailable and
-the training set itself has to be rebalanced.
+The grade is not accuracy and not a catch rate. It is what the calls cost, averaged per weld, on a consequence table shipped with the export — and that table is steeply asymmetric. Shipping a weld that turns out to have a crack costs 900; pulling a sound weld off the line costs 40. The correct call for a weld is therefore the finding with the lowest EXPECTED cost under the posterior, which is not in general the most likely finding. A classifier that takes the argmax is right most of the time and scores 26.4 against a 20.0 bar, because it saves 40 on a re-scan and pays 900 for the crack it shipped.
 
-Calibrated across 5 generator seeds: the best wrong answer is 0.4406 and the weakest of four
-correct routes is 0.4998, with the bar at 0.47 between them. Scoring is on the predicted
-class via argmax, so there is no decision threshold to tune and no element of luck in
-clearing the bar.
+That is the first axis and it is not stated as a rule anywhere. instruction.md says what the plant is judged on and points at the table; working out that this means minimising expected cost rather than maximising accuracy is the agent's to do.
+
+The second axis is the class imbalance — 70% of welds are clean, cracks are 2% — and the two INTERACT, which is what makes this more than two independent requirements. The cost rule needs posteriors that carry the population's own class priors. Rebalancing the training set, which is the standard fix for imbalance and what smartcore's missing sample_weight argument pushes you toward, shifts exactly those priors. Applying the cost table to rebalanced posteriors scores 30.3 — worse than rebalancing and taking the argmax (21.1), and far worse than not rebalancing at all (18.2). Two individually reasonable steps compose into something worse than either. Both correct routes remain available: fit on the natural class mix and apply the table, or rebalance and divide the training priors back out first.
+
+A third, smaller obstacle sits underneath: smartcore 0.3.2 exposes no predict_proba and its predict() returns the argmax, so the posteriors the decision needs have to be rebuilt from model.coefficients() and model.intercept() and passed through a softmax. The parameters are reachable, so this is discoverable rather than a wall, but the decision cannot be delegated to the library.
+
+Two further columns, ut_scan_minutes and repair_pass_count, are written by the inspection and repair systems after a finding is signed off and carry nothing on the held-back batch. They are a provenance hazard rather than the difficulty: the README states where each column is written in the process, so an agent that reads it before selecting features can rule them out on that evidence alone, without needing to detect the leak empirically.
+
+Calibrated across five generator seeds: the two correct routes score 17.65-19.48 and 17.63-19.09, the strongest wrong route (rebalance then argmax) ceilings at 20.90, plain argmax at 29.16, and calling everything a crack at 33.49. The bar sits at 20.0. solution/calibrate_seeds.py reproduces the sweep.
 """
 
 solution_explanation = """
-The reference (solution/solve.sh) writes src/main.rs and runs the Cargo project. It groups
-the training rows by finding and draws the same number of rows for each of the five classes,
-cycling deterministically through each class's rows with replacement for the rare ones, so
-every class carries equal weight in the loss. It then standardizes with the training means
-and sds and fits smartcore's multinomial LogisticRegression, writing back the argmax class
-name. It scores about 0.60 against the 0.47 bar.
+The reference (solution/solve.sh) installs src/main.rs and runs the Cargo project. It reads both CSVs and the consequence table, fits smartcore's multinomial LogisticRegression on the training rows at their natural class mix — no resampling, so the posteriors carry the population's own priors — and standardises with the training means and sds.
+
+Because smartcore exposes no predict_proba and its predict() takes the argmax, the reference rebuilds the class scores from the fitted parameters: for class c, score = x . coefficients[c] + intercept[c], the same layout predict() consumes, then a softmax over the five scores. For each weld it evaluates the expected cost of every possible call against those posteriors and writes the cheapest one, which is not in general the most likely one.
+
+It scores 18.16 per weld on the shipped batch against the 20.0 bar. The same code with the decision rule swapped for an argmax scores 26.40, which is what the oracle_argmax arm checks.
 """
 
 verification_explanation = """
-The verifier runs in its own container. It collects the agent's crate sources
-(/app/predictor/src, Cargo.toml, Cargo.lock) and the shipped export (/app/data) as
-artifacts, drops them onto a prepared skeleton whose dependency tree is already compiled,
-and runs cargo build/run --release --offline itself. The graded predictions.csv is
-therefore always the output of a clean build of the agent's own code — a hand-written
-predictions file never reaches the grader.
+The verifier runs in its own container. It collects the agent's crate sources and the shipped export as artifacts, drops them onto a prepared skeleton whose dependency tree is already compiled, and runs cargo build/run --release --offline itself, so the graded predictions.csv is always the output of a clean build of the agent's own code. The image carries no prebuilt binary for the crate (cargo clean -p after the skeleton build) and test.sh stamps the collected sources before building, so cargo cannot mistake an uploaded source older than the image for one it has already compiled and quietly run the skeleton instead. Root's PATH is set explicitly in test.sh, pytest is started through the interpreter's full path, and cargo's home stays root-owned, so nothing agent code can write sits on the path root resolves its own commands through. cheat_path_shim is that attack made runnable, a crate with no model that writes an exit-0 python into every directory on root's PATH it can reach, and it scores 0 with every write refused.
 
-Rebuilding the agent's crate means the verifier executes code the agent wrote, so that step
-is the one thing it does not do as root: test.sh hands the crate to an unprivileged user and
-runs the build under it. The graded answer key is baked into the verifier image at
-/opt/golden, readable only by root. Harbor owns the /tests and /logs mounts at runtime, so
-permissions cannot be enforced there and this verifier deliberately leaves them alone; the
-plaintext copy of the labels that arrives under /tests is closed to the unprivileged user on
-a best-effort basis, and whether that succeeded is logged rather than allowed to fail the
-run. Root alone runs pytest and decides the reward from its exit status, and the shipped
-export is left read-only to the build user. Verified by four cheat arms — crates that read
-either copy of the labels, one that overwrites test_outputs.py, one that writes reward.txt
-directly — each of which compiles and then fails on permissions, scoring 0.
+The consequence table is held in test_outputs.py, not read from /app/data. The agent is shipped a copy as domain evidence, but a verifier that graded against the agent's copy would be grading against numbers the agent can edit.
 
-tests/test_outputs.py then runs six checks: the shipped export is unaltered (sha256), the
-schema, one-to-one coverage of the held-back welds, that every call is one of the five
-recorded findings, that the calls did not collapse to a single class, and that the mean
-per-type catch rate against tests/golden/test_labels.csv reaches 0.47. That bar sits between
-the strongest wrong approach and the weakest correct one, both established by sweeping each
-route across several generator seeds: fitting on the raw class balance peaks at 0.4406 even
-when tuned, while the weakest passing route reaches 0.4998, with the threshold frozen
-against the tightest seed. Only pytest is installed, so the CSV reading and the macro recall
-come from the standard library.
+Rebuilding the crate means the verifier executes code the agent wrote, so that step is not done as root. test.sh hands the crate to an unprivileged build user through setpriv with supplementary groups cleared and no-new-privileges set. The graded answer key is baked into the image at /opt/golden, readable only by root. The whole /tests mount is closed to the build user before anything untrusted starts, and if it is still reachable the run is abandoned with reward 0 rather than graded. The build runs in its own session and its process group is torn down, then every process that user still owns is swept, before pytest runs and before the reward is written. pytest runs with -P so the working directory stays off the import path, closing the /app/pytest.py shadow that would otherwise let agent code no-op the suite; the cheat_pytest_shadow arm plants exactly that and scores 0.
+
+Eleven checks run, six on the shipped batch and five on the held-back run, because both are held to the same structural contract. On the shipped batch: the export is unaltered (sha256), the schema is exactly the two named columns with no extra fields in a row, one-to-one coverage of the held-back welds, every call is one of the five recorded findings, the calls did not collapse onto one or two classes, and the mean consequence cost comes in strictly under 20.0 per weld. The instruction says under 20.0, so the comparison is strict and a run landing exactly on the bar fails it.
+
+The next five grade a SECOND run against a batch from a different welding cell, process B in solution/generate_data.py, whose settings place every finding in a different region of the process envelope, with that cell's own training file, baked in at /opt/holdout and never present in any container the agent can reach. Four of them are the same structural checks as above, which they were not in an earlier version: schema and row width, known findings, at least three distinct classes, and one-to-one weld coverage. Without them a wrong header passed on that run, because the first line is skipped whatever it says, and so did a run that collapsed onto two findings. The fifth checks that the cost stays strictly under a slacker 22.0, which instruction.md names. That run is also what proves the program reads train.csv rather than carrying a rule worked out once: measured across three seeds of the second cell, a model fitted to the shipped cell and carried across costs 46.7 to 49.0 per weld there, a depth-four decision tree fitted once to the shipped cell, which is what a rule of feature thresholds worked out in advance amounts to, costs 53.6 to 58.9 with the cost rule and 52.9 to 58.8 taking its most likely finding, while a model refitted to that cell's training file costs 15.7 to 17.1, so the bar sits far from both. A relabeling of the training file could not have shown that, since a relabeling is a symmetry a program can mirror; a different cell is not. The instruction says the second batch is from a different cell with its own training file. The instruction says to keep everything under /app/predictor/src, since that and the two Cargo files are all that is collected, so a crate split into path dependencies beside src is ruled out in words rather than lost quietly. Mechanically: test.sh stages each output aside root-only, and only a regular file is staged, so a symlink left at /app/predictions.csv pointing into the golden directory is refused rather than followed, and pytest opens the staged files with O_NOFOLLOW as well. It swaps /app/data, re-runs the same binary, and restores the agent's export byte-for-byte so the sha256 check still tests what the agent left.
+
+The bar was placed between measured routes rather than by taste, across five generator seeds: the two correct routes score 17.65-19.48 and 17.63-19.09, the strongest wrong route ceilings at 20.90 and plain argmax at 29.16. Three arms check the axes discriminate rather than only that cheating is blocked, each the reference changed in one place and each run through the real verifier container. oracle_argmax calls the most likely finding instead of the cheapest and scores 0, which is what makes the cost rule the graded axis. cheat_frozen_predictions freezes the reference's own output into the source and fails the held-back run, and cheat_train_snapshot carries the shipped training file inside the source and never reads /app/data, so it fits the wrong cell there and fails the same way. cheat_pytest_shadow plants the import shadow. solution/generate_data.py regenerates the shipped CSVs byte for byte and solution/calibrate_seeds.py reproduces the route table, so the calibration is re-runnable rather than asserted.
 """
 
 relevant_experience = """
-I build classifiers for industrial inspection and quality data, where the class of interest
-is almost always the rarest one and headline accuracy actively misleads — the models that
-look best are the ones that quietly never call a crack. Calibrating this task meant
-establishing across five generated seeds that the wrong arms are the more accurate ones, and
-that no amount of extra model capacity closes the gap, so the bar separates a correctly
-weighted fit from a well-tuned but misdirected one. Implementing it in smartcore, which has
-no sample_weight argument, meant doing the rebalancing by explicit resampling.
+I build classifiers for industrial inspection and quality data, where the class of interest is almost always the rarest one and the fields that look most predictive are usually the ones the inspection and repair systems wrote down after the fact. Working out which columns of a maintenance export are actually available at decision time, when the export itself is assembled from work orders at different stages of their life, is most of the job — and it is the part no cross-validation will do for you. Calibrating this task meant establishing on the shipped batch, and again across five generated seeds, that the design a split of the training rows recommends collapses on the batch that is graded, that the unrebalanced fit also falls below the bar, and that no amount of extra model capacity closes either gap. Implementing it in smartcore, which has no sample_weight argument, meant doing the reweighting by explicit resampling.
 """
 
 [verifier]
-timeout_sec = 1800
+# Two runs of the agent's crate happen here, not one: the graded batch and then the holdout
+# batch that proves the program refits. Only the first compiles, but 1800 left no headroom.
+timeout_sec = 3600
 environment_mode = "separate"
+# Nothing is fetched at grade time; every verifier dependency is baked into tests/Dockerfile.
+network_mode = "no-network"
 
 [agent]
 timeout_sec = 3600
+# Solved offline by design: the crates are pre-fetched and pinned in Cargo.lock, and network
+# access would let the agent fetch a rebalancing/ML library instead of writing the fit.
+network_mode = "no-network"
 
 [environment]
-network_mode = "no-network"
+# Must be "public" on every task, offline ones included: this is the phase where the image is
+# built and the agent harness is installed, and that installation needs the network. Closing
+# it here fails before the agent ever runs. The agent and verifier phases above are what
+# actually keep this task offline.
+network_mode = "public"
 build_timeout_sec = 900
 cpus = 2
 memory_mb = 6144

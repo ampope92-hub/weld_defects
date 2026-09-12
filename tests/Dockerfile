@@ -24,7 +24,8 @@ COPY --from=rust /usr/local/cargo /usr/local/cargo
 COPY --from=rust /usr/local/rustup /usr/local/rustup
 
 # Verifier tooling, pinned. Nothing is installed at trial time.
-RUN pip install --no-cache-dir pytest==8.4.1 pytest-json-ctrf==0.3.5
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --require-hashes --no-deps -r /tmp/requirements.txt && rm -f /tmp/requirements.txt
 
 # test.sh rebuilds and runs the agent's crate, so agent-authored code executes in this
 # image — and this image holds the answer key. That code runs as `runner`, never root:
@@ -54,11 +55,13 @@ RUN cd /app/predictor \
 # Artifact landing directories must exist before Harbor uploads the declared artifacts.
 RUN mkdir -p /app/predictor/src /app/data
 
-# Building as `runner` means cargo writes target/ and the CARGO_HOME package-cache lock;
-# neither holds anything secret. /app is runner-owned so the crate can create
-# /app/predictions.csv, but sticky so runner cannot rename or delete the root-owned
-# export it sits beside.
-RUN chown -R runner:runner /app /usr/local/cargo \
+# Building as `runner` means cargo writes target/, which is under /app. Cargo's home stays
+# root-owned: it sits first on PATH, and a runner-owned copy would let the crate drop a file
+# named python there for root's own pytest call to pick up. Offline, with the registry already
+# fetched, cargo builds fine without writing to its home. /app is runner-owned so the crate
+# can create /app/predictions.csv, but sticky so runner cannot rename or delete the
+# root-owned export it sits beside.
+RUN chown -R runner:runner /app \
     && chmod 1755 /app
 
 # The graded answer key, at a path Harbor does not reserve, readable only by root. /tests is
@@ -66,6 +69,13 @@ RUN chown -R runner:runner /app /usr/local/cargo \
 # verifier failure — so the labels cannot be protected there. test_outputs.py reads this copy.
 COPY golden /opt/golden
 RUN chmod 700 /opt/golden && chmod 600 /opt/golden/*
+
+# The holdout batch. test.sh swaps this in for /app/data and runs the agent's program a second
+# time, which is what proves the calls are fitted at run time rather than pasted into the
+# source. Same root-only treatment as the answer key: its train/test_features are copied into
+# /app/data for that run, but test_labels.csv is never readable by the crate.
+COPY holdout /opt/holdout
+RUN chmod 700 /opt/holdout && chmod 600 /opt/holdout/*
 
 COPY . /tests/
 

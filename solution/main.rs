@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use std::error::Error;
 use std::io::Write;
 
+use smartcore::linalg::basic::arrays::Array;
 use smartcore::linalg::basic::matrix::DenseMatrix;
 use smartcore::linear::logistic_regression::LogisticRegression;
 
@@ -55,6 +55,23 @@ fn read(path: &str) -> Result<Vec<Weld>, Box<dyn Error>> {
     Ok(out)
 }
 
+/// The contracts table: costs[actual][called], both indexed as FINDINGS.
+fn read_costs(path: &str) -> Result<Vec<Vec<f64>>, Box<dyn Error>> {
+    let text = std::fs::read_to_string(path)?;
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let header: Vec<&str> = lines.next().ok_or("empty cost table")?.split(',').collect();
+    let mut costs = vec![vec![0.0; FINDINGS.len()]; FINDINGS.len()];
+    for line in lines {
+        let cells: Vec<&str> = line.split(',').collect();
+        let actual = FINDINGS.iter().position(|f| *f == cells[0]).ok_or("unknown finding")?;
+        for (col, name) in header.iter().enumerate().skip(1) {
+            let called = FINDINGS.iter().position(|f| f == name).ok_or("unknown call")?;
+            costs[actual][called] = cells[col].trim().parse()?;
+        }
+    }
+    Ok(costs)
+}
+
 fn row(w: &Weld) -> Vec<f64> {
     let mut v = vec![w.heat_input, w.travel_speed, w.gas_flow, w.root_gap, w.plate_thk,
                      w.preheat];
@@ -78,25 +95,28 @@ fn main() -> Result<(), Box<dyn Error>> {
     let train = read("/app/data/train.csv")?;
     let batch = read("/app/data/test_features.csv")?;
 
-    // group the training rows by finding so each one can be drawn evenly
-    let mut by_class: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (i, w) in train.iter().enumerate() {
-        by_class.entry(w.defect.as_str()).or_default().push(i);
+    // No rebalancing. The decision below needs posteriors that carry the population's own
+    // class priors: resampling the training set shifts those priors, and applying the cost
+    // table to shifted posteriors is worse than ignoring costs altogether. (Rebalancing and
+    // then dividing the priors back out also works; not rebalancing is simply the shorter road.)
+    // The classes the model knows are the ones the training file holds. A batch whose training
+    // file never records some finding cannot be called that finding, and the fit is over the
+    // findings present, mapped to a compact index, so a missing class does not leave a hole.
+    let mut present: Vec<usize> = Vec::new();
+    for w in train.iter() {
+        if let Some(c) = FINDINGS.iter().position(|f| *f == w.defect) {
+            if !present.contains(&c) {
+                present.push(c);
+            }
+        }
     }
-    let per_class = train.len() / FINDINGS.len();
-
-    // deterministic draw with replacement: no rng, just cycle each class's rows
+    present.sort_unstable();
     let mut xtr_v = Vec::new();
     let mut ytr = Vec::new();
-    for (label, name) in FINDINGS.iter().enumerate() {
-        let idx = match by_class.get(name) {
-            Some(v) if !v.is_empty() => v,
-            _ => continue,
-        };
-        for k in 0..per_class {
-            let w = &train[idx[k % idx.len()]];
+    for w in train.iter() {
+        if let Some(c) = FINDINGS.iter().position(|f| *f == w.defect) {
             xtr_v.push(row(w));
-            ytr.push(label as i32);
+            ytr.push(present.iter().position(|p| *p == c).unwrap() as i32);
         }
     }
 
@@ -106,12 +126,57 @@ fn main() -> Result<(), Box<dyn Error>> {
     let xtr: DenseMatrix<f64> = DenseMatrix::from_2d_vec(&xtr_v);
     let xte: DenseMatrix<f64> = DenseMatrix::from_2d_vec(&xte_v);
     let model = LogisticRegression::fit(&xtr, &ytr, Default::default())?;
-    let pred = model.predict(&xte)?;
+
+    // smartcore's LogisticRegression exposes no predict_proba, and predict() takes the argmax
+    // of the class scores — which is the wrong decision here. The scores are recoverable from
+    // the fitted parameters: for class c, score = x . coefficients[c] + intercept[c], laid out
+    // exactly as predict() consumes them. Softmax turns those into posteriors.
+    let coef = model.coefficients();
+    let icept = model.intercept();
+    let k = present.len();
+    let nfeat = xte_v[0].len();
+
+    let costs = read_costs("/app/data/consequence_costs.csv")?;
 
     let mut out = std::fs::File::create("/app/predictions.csv")?;
     writeln!(out, "weld_id,defect")?;
-    for (w, label) in batch.iter().zip(&pred) {
-        writeln!(out, "{},{}", w.weld_id, FINDINGS[*label as usize])?;
+    for (i, w) in batch.iter().enumerate() {
+        // With exactly two findings present smartcore fits one logit (class 1 against class 0)
+        // and stores a single coefficient row; with three or more it stores one row per class.
+        let p: Vec<f64> = if k == 2 {
+            let mut acc = *icept.get((0, 0));
+            for j in 0..nfeat {
+                acc += xte_v[i][j] * *coef.get((0, j));
+            }
+            let p1 = 1.0 / (1.0 + (-acc).exp());
+            vec![1.0 - p1, p1]
+        } else {
+            let mut score = vec![0.0f64; k];
+            for c in 0..k {
+                let mut acc = *icept.get((c, 0));
+                for j in 0..nfeat {
+                    acc += xte_v[i][j] * *coef.get((c, j));
+                }
+                score[c] = acc;
+            }
+            let hi = score.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let ex: Vec<f64> = score.iter().map(|s| (s - hi).exp()).collect();
+            let z: f64 = ex.iter().sum();
+            ex.iter().map(|e| e / z).collect()
+        };
+
+        // Call the finding with the lowest EXPECTED cost, not the most likely one. The posterior
+        // is over the findings present in the training file; the call can be any finding.
+        let mut best = 0usize;
+        let mut best_cost = f64::INFINITY;
+        for call in 0..FINDINGS.len() {
+            let exp_cost: f64 = (0..k).map(|a| p[a] * costs[present[a]][call]).sum();
+            if exp_cost < best_cost {
+                best_cost = exp_cost;
+                best = call;
+            }
+        }
+        writeln!(out, "{},{}", w.weld_id, FINDINGS[best])?;
     }
     println!("wrote /app/predictions.csv ({} welds)", batch.len());
     Ok(())

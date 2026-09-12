@@ -1,0 +1,6 @@
+actual,none,porosity,undercut,lack_of_fusion,crack
+none,0.00,40.00,40.00,40.00,40.00
+porosity,25.00,0.00,6.25,6.25,6.25
+undercut,60.00,15.00,0.00,15.00,15.00
+lack_of_fusion,350.00,87.50,87.50,0.00,87.50
+crack,900.00,225.00,225.00,225.00,0.00
